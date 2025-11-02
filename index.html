@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WeChat Chat Redactor</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      background-color: #f9fafb;
+    }
+    header {
+      padding: 1rem;
+      background-color: #111827;
+      color: white;
+      text-align: center;
+    }
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding: 1rem;
+      background-color: #ffffff;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+      border-bottom: 1px solid #e5e7eb;
+    }
+    #controls > * {
+      margin: 0.25rem;
+    }
+    button {
+      padding: 0.5rem 0.75rem;
+      border: 1px solid #d1d5db;
+      background-color: #f3f4f6;
+      border-radius: 0.375rem;
+      cursor: pointer;
+      font-size: 0.875rem;
+    }
+    button.selected {
+      background-color: #3b82f6;
+      color: white;
+      border-color: #3b82f6;
+    }
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+    label {
+      font-size: 0.75rem;
+    }
+    #canvasContainer {
+      flex: 1;
+      overflow: auto;
+      background-color: #e5e7eb;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    canvas {
+      max-width: 100%;
+      height: auto;
+      cursor: crosshair;
+      border: 1px solid #d1d5db;
+      background-color: white;
+    }
+    input[type="range"] {
+      width: 100px;
+    }
+    input[type="color"] {
+      height: 32px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>微信聊天截图打码工具</h1>
+  </header>
+  <div id="controls">
+    <input id="fileInput" type="file" accept="image/*" />
+    <button id="rectTool" class="selected" title="矩形工具">矩形</button>
+    <button id="brushTool" title="画笔工具">画笔</button>
+    <button id="pixelateEffect" class="selected" title="像素化">像素化</button>
+    <button id="blurEffect" title="模糊">模糊</button>
+    <button id="blackEffect" title="黑框">黑框</button>
+    <label for="intensityRange">强度/大小</label>
+    <input id="intensityRange" type="range" min="2" max="40" value="10" />
+    <label for="colorInput" style="display:none;">颜色</label>
+    <input id="colorInput" type="color" value="#000000" style="display:none;" />
+    <button id="undoBtn" disabled>撤销</button>
+    <button id="redoBtn" disabled>重做</button>
+    <button id="saveMaskBtn" disabled>保存遮罩 JSON</button>
+    <input id="maskInput" type="file" accept="application/json" style="display:none;" />
+    <button id="loadMaskBtn" disabled>载入遮罩 JSON</button>
+    <button id="exportPngBtn" disabled>导出 PNG</button>
+    <button id="exportJpgBtn" disabled>导出 JPG</button>
+  </div>
+  <div id="canvasContainer">
+    <canvas id="canvas"></canvas>
+  </div>
+  <script>
+    (() => {
+      const fileInput = document.getElementById('fileInput');
+      const rectToolBtn = document.getElementById('rectTool');
+      const brushToolBtn = document.getElementById('brushTool');
+      const pixelateBtn = document.getElementById('pixelateEffect');
+      const blurBtn = document.getElementById('blurEffect');
+      const blackBtn = document.getElementById('blackEffect');
+      const intensityRange = document.getElementById('intensityRange');
+      const colorInput = document.getElementById('colorInput');
+      const undoBtn = document.getElementById('undoBtn');
+      const redoBtn = document.getElementById('redoBtn');
+      const saveMaskBtn = document.getElementById('saveMaskBtn');
+      const loadMaskBtn = document.getElementById('loadMaskBtn');
+      const exportPngBtn = document.getElementById('exportPngBtn');
+      const exportJpgBtn = document.getElementById('exportJpgBtn');
+      const maskInput = document.getElementById('maskInput');
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+
+      let image = null;
+      let scale = 1;
+      let tool = 'rect'; // 'rect' or 'brush'
+      let effect = 'pixelate'; // 'pixelate','blur','black'
+      let operations = [];
+      let redoStack = [];
+      let drawing = false;
+      let startX = 0;
+      let startY = 0;
+      let currentPath = [];
+
+      function resetCanvas() {
+        if (!image) return;
+        canvas.width = image.width;
+        canvas.height = image.height;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(image, 0, 0);
+      }
+
+      function applyOperation(op) {
+        const { type, effect: eff, rect, path, intensity, color, radius } = op;
+        if (!image) return;
+        if (type === 'rect') {
+          const { x, y, w, h } = rect;
+          if (eff === 'pixelate') {
+            pixelateRect(x, y, w, h, intensity);
+          } else if (eff === 'blur') {
+            blurRect(x, y, w, h, intensity);
+          } else if (eff === 'black') {
+            blackRect(x, y, w, h, color, radius);
+          }
+        } else if (type === 'brush') {
+          // For brush, apply effect for each point in path with a square size
+          const size = intensity;
+          path.forEach(pt => {
+            const bx = pt.x - size / 2;
+            const by = pt.y - size / 2;
+            if (eff === 'pixelate') {
+              pixelateRect(bx, by, size, size, Math.max(2, Math.floor(intensity / 2)));
+            } else if (eff === 'blur') {
+              blurRect(bx, by, size, size, intensity);
+            } else if (eff === 'black') {
+              blackRect(bx, by, size, size, color, radius);
+            }
+          });
+        }
+      }
+
+      function redrawAll() {
+        resetCanvas();
+        operations.forEach(op => applyOperation(op));
+      }
+
+      function pixelateRect(x, y, w, h, blockSize) {
+        // clamp coordinates within canvas
+        x = Math.max(0, Math.floor(x));
+        y = Math.max(0, Math.floor(y));
+        w = Math.min(canvas.width - x, Math.ceil(w));
+        h = Math.min(canvas.height - y, Math.ceil(h));
+        const off = document.createElement('canvas');
+        off.width = w;
+        off.height = h;
+        const offCtx = off.getContext('2d');
+        offCtx.imageSmoothingEnabled = false;
+        offCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+        const scaledW = Math.max(1, Math.floor(w / blockSize));
+        const scaledH = Math.max(1, Math.floor(h / blockSize));
+        const temp = document.createElement('canvas');
+        temp.width = scaledW;
+        temp.height = scaledH;
+        const tempCtx = temp.getContext('2d');
+        tempCtx.imageSmoothingEnabled = false;
+        tempCtx.drawImage(off, 0, 0, w, h, 0, 0, scaledW, scaledH);
+        offCtx.clearRect(0, 0, w, h);
+        offCtx.drawImage(temp, 0, 0, scaledW, scaledH, 0, 0, w, h);
+        ctx.drawImage(off, x, y);
+      }
+
+      function blurRect(x, y, w, h, blurRadius) {
+        x = Math.max(0, Math.floor(x));
+        y = Math.max(0, Math.floor(y));
+        w = Math.min(canvas.width - x, Math.ceil(w));
+        h = Math.min(canvas.height - y, Math.ceil(h));
+        const off = document.createElement('canvas');
+        off.width = w;
+        off.height = h;
+        const offCtx = off.getContext('2d');
+        offCtx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+        const out = document.createElement('canvas');
+        out.width = w;
+        out.height = h;
+        const outCtx = out.getContext('2d');
+        outCtx.filter = `blur(${blurRadius}px)`;
+        outCtx.drawImage(off, 0, 0);
+        ctx.drawImage(out, x, y);
+      }
+
+      function blackRect(x, y, w, h, fillColor, radiusVal) {
+        x = Math.max(0, Math.floor(x));
+        y = Math.max(0, Math.floor(y));
+        w = Math.min(canvas.width - x, Math.ceil(w));
+        h = Math.min(canvas.height - y, Math.ceil(h));
+        ctx.save();
+        ctx.fillStyle = fillColor;
+        const r = Math.min(radiusVal, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.lineTo(x + w - r, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + r);
+        ctx.lineTo(x + w, y + h - r);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
+        ctx.lineTo(x + r, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - r);
+        ctx.lineTo(x, y + r);
+        ctx.quadraticCurveTo(x, y, x + r, y);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+
+      function setTool(newTool) {
+        tool = newTool;
+        rectToolBtn.classList.toggle('selected', tool === 'rect');
+        brushToolBtn.classList.toggle('selected', tool === 'brush');
+      }
+
+      function setEffect(newEffect) {
+        effect = newEffect;
+        pixelateBtn.classList.toggle('selected', effect === 'pixelate');
+        blurBtn.classList.toggle('selected', effect === 'blur');
+        blackBtn.classList.toggle('selected', effect === 'black');
+        // Show color input only for black effect
+        if (effect === 'black') {
+          colorInput.style.display = '';
+          colorInput.previousElementSibling.style.display = '';
+        } else {
+          colorInput.style.display = 'none';
+          colorInput.previousElementSibling.style.display = 'none';
+        }
+      }
+
+      rectToolBtn.addEventListener('click', () => setTool('rect'));
+      brushToolBtn.addEventListener('click', () => setTool('brush'));
+      pixelateBtn.addEventListener('click', () => setEffect('pixelate'));
+      blurBtn.addEventListener('click', () => setEffect('blur'));
+      blackBtn.addEventListener('click', () => setEffect('black'));
+
+      fileInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const img = new Image();
+        img.onload = () => {
+          image = img;
+          operations = [];
+          redoStack = [];
+          resetCanvas();
+          updateButtons();
+        };
+        img.onerror = () => alert('无法加载图片');
+        img.src = URL.createObjectURL(file);
+      });
+
+      // Paste from clipboard
+      window.addEventListener('paste', (e) => {
+        if (e.clipboardData) {
+          const items = e.clipboardData.items;
+          for (let i = 0; i < items.length; i++) {
+            if (items[i].type.indexOf('image') !== -1) {
+              const blob = items[i].getAsFile();
+              const img = new Image();
+              img.onload = () => {
+                image = img;
+                operations = [];
+                redoStack = [];
+                resetCanvas();
+                updateButtons();
+              };
+              img.src = URL.createObjectURL(blob);
+              return;
+            }
+          }
+        }
+      });
+
+      function updateButtons() {
+        const hasOps = operations.length > 0;
+        undoBtn.disabled = operations.length === 0;
+        redoBtn.disabled = redoStack.length === 0;
+        saveMaskBtn.disabled = !hasOps;
+        loadMaskBtn.disabled = !image;
+        exportPngBtn.disabled = !image;
+        exportJpgBtn.disabled = !image;
+      }
+
+      canvas.addEventListener('mousedown', (e) => {
+        if (!image) return;
+        drawing = true;
+        const rect = canvas.getBoundingClientRect();
+        startX = (e.clientX - rect.left);
+        startY = (e.clientY - rect.top);
+        currentPath = [];
+        if (tool === 'brush') {
+          currentPath.push({ x: startX, y: startY });
+        }
+      });
+      canvas.addEventListener('mousemove', (e) => {
+        if (!drawing || !image) return;
+        const rect = canvas.getBoundingClientRect();
+        const x = (e.clientX - rect.left);
+        const y = (e.clientY - rect.top);
+        if (tool === 'brush') {
+          currentPath.push({ x, y });
+          // draw temporary dot for feedback
+          ctx.save();
+          ctx.globalAlpha = 0.3;
+          if (effect === 'black') {
+            const size = parseInt(intensityRange.value);
+            blackRect(x - size / 2, y - size / 2, size, size, colorInput.value, parseInt(intensityRange.value));
+          } else if (effect === 'pixelate') {
+            pixelateRect(x - 5, y - 5, 10, 10, Math.max(2, Math.floor(intensityRange.value / 2)));
+          } else if (effect === 'blur') {
+            blurRect(x - 5, y - 5, 10, 10, parseInt(intensityRange.value));
+          }
+          ctx.restore();
+        } else {
+          // draw overlay rectangle for feedback
+          redrawAll();
+          const w = x - startX;
+          const h = y - startY;
+          ctx.save();
+          ctx.lineWidth = 1;
+          ctx.strokeStyle = '#10b981';
+          ctx.setLineDash([6, 4]);
+          ctx.strokeRect(startX, startY, w, h);
+          ctx.restore();
+        }
+      });
+      window.addEventListener('mouseup', (e) => {
+        if (!drawing || !image) return;
+        drawing = false;
+        const rectC = canvas.getBoundingClientRect();
+        const endX = (e.clientX - rectC.left);
+        const endY = (e.clientY - rectC.top);
+        if (tool === 'rect') {
+          const x = Math.min(startX, endX);
+          const y = Math.min(startY, endY);
+          const w = Math.abs(endX - startX);
+          const h = Math.abs(endY - startY);
+          if (w < 5 || h < 5) return; // ignore very small rects
+          const op = {
+            type: 'rect',
+            effect,
+            rect: { x, y, w, h },
+            intensity: parseInt(intensityRange.value),
+            color: colorInput.value,
+            radius: parseInt(intensityRange.value)
+          };
+          operations.push(op);
+          redoStack = [];
+          redrawAll();
+        } else if (tool === 'brush') {
+          if (currentPath.length < 2) return;
+          const op = {
+            type: 'brush',
+            effect,
+            path: currentPath.slice(),
+            intensity: parseInt(intensityRange.value),
+            color: colorInput.value,
+            radius: parseInt(intensityRange.value)
+          };
+          operations.push(op);
+          redoStack = [];
+          redrawAll();
+        }
+        updateButtons();
+      });
+
+      undoBtn.addEventListener('click', () => {
+        if (operations.length === 0) return;
+        const op = operations.pop();
+        redoStack.push(op);
+        redrawAll();
+        updateButtons();
+      });
+      redoBtn.addEventListener('click', () => {
+        if (redoStack.length === 0) return;
+        const op = redoStack.pop();
+        operations.push(op);
+        applyOperation(op);
+        updateButtons();
+      });
+
+      saveMaskBtn.addEventListener('click', () => {
+        const data = JSON.stringify(operations);
+        const blob = new Blob([data], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'mask.json';
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+      loadMaskBtn.addEventListener('click', () => {
+        maskInput.click();
+      });
+      maskInput.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+       if (!file) return;
+        const reader = new FileReader();
+        reader.onload = () => {
+          try {
+            const ops = JSON.parse(reader.result);
+            operations = ops;
+            redoStack = [];
+            redrawAll();
+            updateButtons();
+          } catch (err) {
+            alert('无法解析 JSON');
+          }
+        };
+        reader.readAsText(file);
+        // reset input
+        maskInput.value = '';
+      });
+
+      exportPngBtn.addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.href = canvas.toDataURL('image/png');
+        link.download = 'redacted.png';
+        link.click();
+      });
+      exportJpgBtn.addEventListener('click', () => {
+        const link = document.createElement('a');
+        link.href = canvas.toDataURL('image/jpeg');
+        link.download = 'redacted.jpg';
+        link.click();
+      });
+
+      // Initialize state
+      updateButtons();
+      setTool('rect');
+      setEffect('pixelate');
+    })();
+  </script>
+</body>
+</html>
